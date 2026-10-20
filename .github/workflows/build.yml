@@ -1,0 +1,194 @@
+name: build-esp-arm64
+
+# Needs the prebuilt `esp` binary in the repo: the file named `esp`, or esp-arm64.zip containing it.
+# start.sh and the libunbuf.so shim are generated here; output: artifact "esp-arm64".
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # sha256 of the esp binary that was analyzed; a mismatch only warns.
+  ESP_SHA256: 8e5dab684fa1607b2534a94161d0f4bcb432b8f4fee628630d0d93c9d8c6c505
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Locate and verify esp
+        run: |
+          set -eu
+          mkdir -p build
+          # 1) plain binary named "esp" anywhere in the repo
+          ESP=$(find . -type f -name esp -not -path "./.git/*" -not -path "./build/*" -not -path "./dist/*" | head -n 1)
+          # 2) or inside any .zip in the repo (e.g. the original esp-arm64.zip)
+          if [ -z "$ESP" ]; then
+            for Z in $(find . -type f -name '*.zip' -not -path "./.git/*" -not -path "./dist/*"); do
+              ENTRY=$(unzip -Z1 "$Z" 2>/dev/null | grep -E '(^|/)esp$' | head -n 1 || true)
+              if [ -n "$ENTRY" ]; then
+                unzip -p "$Z" "$ENTRY" > build/esp
+                ESP=build/esp
+                echo "esp taken from $Z ($ENTRY)"
+                break
+              fi
+            done
+          fi
+          if [ -z "$ESP" ]; then
+            echo "::error::esp not found. Upload the file named exactly 'esp' (or esp-arm64.zip) to the repo root: Add file > Upload files."
+            echo "Repo content:"; find . -type f -not -path "./.git/*" | head -50
+            exit 1
+          fi
+          file "$ESP" | grep -q "ARM aarch64" || { echo "::error::esp is not ELF aarch64"; exit 1; }
+          GOT=$(sha256sum "$ESP" | cut -d' ' -f1)
+          [ "$GOT" = "$ESP_SHA256" ] || echo "::warning::esp sha256 differs from analyzed build: $GOT"
+          echo "ESP_PATH=$ESP" >> "$GITHUB_ENV"
+
+      - name: Write unbuf.c
+        run: |
+          mkdir -p build
+          cat > build/unbuf.c <<'EOF_UNBUF'
+          /* LD_PRELOAD shim: make stdout/stderr unbuffered so esp.log is written even if the process is killed or hangs. */
+          #include <stdio.h>
+
+          __attribute__((constructor)) static void unbuf_init(void) {
+              setvbuf(stdout, NULL, _IONBF, 0);
+              setvbuf(stderr, NULL, _IONBF, 0);
+          }
+          EOF_UNBUF
+
+      - name: Build libunbuf.so (NDK, arm64, API 24)
+        run: |
+          set -eu
+          NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-}}}"
+          [ -d "$NDK" ] || { echo "::error::Android NDK not found on runner"; exit 1; }
+          CC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+          "$CC" -shared -fPIC -O2 -o build/libunbuf.so build/unbuf.c
+          file build/libunbuf.so | grep -q "ARM aarch64"
+
+      - name: Write start.sh
+        run: |
+          cat > build/start.sh <<'EOF_START'
+          #!/system/bin/sh
+          # Run as root. Put esp (+ libunbuf.so) and start.sh anywhere (same folder, /sdcard, /sdcard/Download, /data/local/tmp).
+          # usage: start.sh [package]   (package optional; default = any process that maps libil2cpp.so)
+          # Binary always runs from /data/local/tmp (sdcard is noexec). Diagnostics go to esp_diag.txt.
+          DIR=${ESP_DIR:-/data/local/tmp}
+          LOG="$DIR/esp.log"
+          DIAG="$DIR/esp_diag.txt"
+
+          [ "$(id -u)" = "0" ] || { echo "need root"; exit 1; }
+
+          SELF_DIR=$(dirname "$0" 2>/dev/null)
+          SEARCH="$SELF_DIR /sdcard /sdcard/Download /storage/emulated/0 /storage/emulated/0/Download /storage/emulated/0/MT2 /sdcard/MT2 /data/local /data/media/0 /data/media/0/Download"
+
+          # --- locate esp ($DIR/esp may be a FOLDER if the archive was extracted as "esp") ---
+          BIN=""
+          if [ -f "$DIR/esp" ]; then
+              BIN="$DIR/esp"
+          elif [ -f "$DIR/esp/esp" ]; then
+              BIN="$DIR/esp/esp"
+          else
+              SRC=""
+              for d in $SEARCH; do
+                  [ -f "$d/esp" ] && { SRC="$d/esp"; break; }
+              done
+              [ -n "$SRC" ] || { echo "esp not found (looked in $DIR, $DIR/esp/, script folder, sdcard, Download)"; exit 1; }
+              BIN="$DIR/esp"
+              [ -d "$BIN" ] && BIN="$DIR/esp/esp"
+              cp "$SRC" "$BIN" || { echo "cannot copy $SRC -> $BIN"; exit 1; }
+              echo "copied $SRC -> $BIN"
+          fi
+          chmod 755 "$BIN"
+          echo "using $BIN"
+
+          # --- locate libunbuf.so (optional: makes the log unbuffered) ---
+          PRE=""
+          for d in "$(dirname "$BIN")" "$DIR" $SEARCH; do
+              [ -f "$d/libunbuf.so" ] && { PRE="$d/libunbuf.so"; break; }
+          done
+          if [ -n "$PRE" ] && [ "$PRE" != "$DIR/libunbuf.so" ]; then
+              cp "$PRE" "$DIR/libunbuf.so" && PRE="$DIR/libunbuf.so" || PRE=""
+          fi
+          [ -n "$PRE" ] && chmod 755 "$PRE"
+
+          # --- stop previous instance ---
+          OLD=$(pidof esp)
+          [ -n "$OLD" ] && kill $OLD 2>/dev/null && sleep 1
+
+          # --- pre-start diagnostics ---
+          {
+              echo "== time";    date
+              echo "== id";      id
+              echo "== android"
+              echo "release=$(getprop ro.build.version.release) sdk=$(getprop ro.build.version.sdk) abi=$(getprop ro.product.cpu.abi) model=$(getprop ro.product.model)"
+              echo "== selinux"; getenforce 2>&1
+              echo "== files";   ls -l "$BIN" "$PRE" /dev/uinput /system/lib64/libgui.so /system/lib64/libutils.so 2>&1
+              echo "== processes mapping libil2cpp.so"
+              for p in /proc/[0-9]*; do
+                  grep -q libil2cpp.so "$p/maps" 2>/dev/null && echo "${p#/proc/} $(tr '\0' ' ' < "$p/cmdline" 2>/dev/null)"
+              done
+              echo "== preload: ${PRE:-none}"
+          } > "$DIAG" 2>&1
+
+          # --- start ---
+          [ -n "$1" ] && export ESP_PKG="$1"
+          cd "$DIR" || exit 1
+          if [ -n "$PRE" ]; then
+              LD_PRELOAD="$PRE" nohup "$BIN" "$@" > "$LOG" 2>&1 &
+          else
+              nohup "$BIN" "$@" > "$LOG" 2>&1 &
+          fi
+          PID=$!
+          sleep 3
+
+          # --- post-start diagnostics ---
+          {
+              echo "== esp pid=$PID"
+              if kill -0 $PID 2>/dev/null; then
+                  echo "state: alive"
+                  grep -E "^(State|Threads)" /proc/$PID/status 2>&1
+                  echo "maps with libgui/libEGL/libGLES/libvulkan:"
+                  grep -cE "libgui|libEGL|libGLES|libvulkan" /proc/$PID/maps 2>&1
+              else
+                  echo "state: EXITED"
+              fi
+              echo "== esp.log"; cat "$LOG" 2>&1
+              echo "== logcat (filtered)"
+              logcat -d -t 400 2>&1 | grep -iE "esp|linker|libgui|DEBUG|tombstone|SIGSEGV|SIGABRT|FATAL|uinput" | tail -n 60
+          } >> "$DIAG" 2>&1
+
+          if kill -0 $PID 2>/dev/null; then
+              echo "esp started pid=$PID (log: $LOG, diag: $DIAG)"
+          else
+              echo "esp exited early (diag: $DIAG):"; cat "$LOG"
+          fi
+          EOF_START
+          sh -n build/start.sh
+
+      - name: Assemble archive
+        run: |
+          set -eu
+          mkdir -p dist/esp-arm64
+          cp "$ESP_PATH" dist/esp-arm64/esp
+          cp build/libunbuf.so build/start.sh dist/esp-arm64/
+          (cd dist/esp-arm64 && sha256sum esp libunbuf.so start.sh > SHA256SUMS && sha256sum -c SHA256SUMS)
+          (cd dist && zip -9 -r ../esp-arm64.zip esp-arm64)
+          unzip -l esp-arm64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: esp-arm64
+          path: esp-arm64.zip
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: esp-arm64.zip
